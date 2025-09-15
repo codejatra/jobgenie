@@ -30,10 +30,10 @@ export default function MotivationLetterGenerator({ job, onClose }: MotivationLe
 
   const generateLetter = async () => {
     setLoading(true);
-    
+
     try {
       const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-      
+
       const prompt = `
         Generate a professional and compelling motivation/cover letter for the following job:
         
@@ -58,11 +58,11 @@ export default function MotivationLetterGenerator({ job, onClose }: MotivationLe
         
         Format the letter properly with date, salutation, body paragraphs, and closing.
       `;
-      
+
       const result = await model.generateContent(prompt);
       const response = await result.response;
       const generatedLetter = response.text();
-      
+
       setLetter(generatedLetter);
       setStep('preview');
       toast.success('Cover letter generated successfully!');

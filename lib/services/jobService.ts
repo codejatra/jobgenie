@@ -1,10 +1,10 @@
 import axios from 'axios';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { 
-  collection, 
-  doc, 
-  setDoc, 
-  getDoc, 
+import {
+  collection,
+  doc,
+  setDoc,
+  getDoc,
   serverTimestamp,
   increment,
   updateDoc
@@ -48,16 +48,16 @@ export interface JobSearchParams {
 export async function refinePrompt(userPrompt: string): Promise<JobSearchParams> {
   try {
     const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-    
+
     // Extract key information from the prompt
     const locationMatch = userPrompt.match(/in\s+([^,]+)/i);
     const location = locationMatch ? locationMatch[1].trim() : '';
-    
+
     return {
       prompt: userPrompt,
       location: location || 'Remote',
-      experience: userPrompt.includes('senior') ? 'senior' : 
-                  userPrompt.includes('junior') ? 'entry' : 'mid',
+      experience: userPrompt.includes('senior') ? 'senior' :
+        userPrompt.includes('junior') ? 'entry' : 'mid',
       employmentType: 'full-time'
     };
   } catch (error) {
@@ -69,13 +69,13 @@ export async function refinePrompt(userPrompt: string): Promise<JobSearchParams>
 // Main search function with real scraping
 export async function searchJobs(params: JobSearchParams): Promise<JobListing[]> {
   console.log('Searching jobs with params:', params);
-  
+
   try {
     // Build search query with location
     const searchQuery = `${params.prompt} jobs ${params.location ? `in ${params.location}` : ''} hiring now`;
-    
+
     console.log('Search query:', searchQuery);
-    
+
     // Call Serper API for real job listings
     const serperResponse = await axios.post(
       'https://google.serper.dev/search',
@@ -97,13 +97,13 @@ export async function searchJobs(params: JobSearchParams): Promise<JobListing[]>
     console.log('Serper response received:', serperResponse.data.organic?.length || 0, 'results');
 
     const searchResults = serperResponse.data.organic || [];
-    
+
     // Also get job-specific results if available
     const jobResults = serperResponse.data.jobs || [];
-    
+
     // Combine and process results
     const allResults = [...jobResults, ...searchResults];
-    
+
     if (allResults.length === 0) {
       console.log('No results from Serper, using fallback');
       return getFallbackJobs(params);
@@ -112,12 +112,12 @@ export async function searchJobs(params: JobSearchParams): Promise<JobListing[]>
     // Process each result
     const jobs: JobListing[] = [];
     const processedUrls = new Set<string>();
-    
+
     for (const result of allResults.slice(0, 10)) {
       // Skip if already processed
       if (processedUrls.has(result.link || result.url)) continue;
       processedUrls.add(result.link || result.url);
-      
+
       try {
         const job = await extractJobFromResult(result, params);
         if (job && job.title && job.company) {
@@ -127,7 +127,7 @@ export async function searchJobs(params: JobSearchParams): Promise<JobListing[]>
       } catch (error) {
         console.error('Error processing job result:', error);
       }
-      
+
       // Limit to 5 jobs to avoid rate limiting
       if (jobs.length >= 5) break;
     }
@@ -149,8 +149,8 @@ export async function searchJobs(params: JobSearchParams): Promise<JobListing[]>
 // Extract job information from search result
 async function extractJobFromResult(result: any, params: JobSearchParams): Promise<JobListing | null> {
   try {
-    const model = genAI.getGenerativeModel({ model: 'Gemini-2.0-Flash' });
-    
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
     // Build context from result
     const context = {
       title: result.title || '',
@@ -200,26 +200,26 @@ IMPORTANT: Return ONLY the JSON object, no other text or markdown.
     const result2 = await model.generateContent(prompt);
     const response = result2.response;
     let text = response.text();
-    
+
     // Clean the response
     text = text.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
-    
+
     // Find JSON object
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       console.error('No JSON found in response');
       return null;
     }
-    
+
     const jobData = JSON.parse(jsonMatch[0]);
-    
+
     // Validate and clean data
     if (!jobData.title || !jobData.company) {
       // Try to extract from original data
       jobData.title = context.position || context.title.split(' at ')[0] || 'Software Developer';
       jobData.company = context.company || context.title.split(' at ')[1] || 'Tech Company';
     }
-    
+
     return {
       id: generateJobId(context.link),
       title: jobData.title,
@@ -257,7 +257,7 @@ IMPORTANT: Return ONLY the JSON object, no other text or markdown.
 // Fallback jobs when API fails
 function getFallbackJobs(params: JobSearchParams): JobListing[] {
   const location = params.location || 'Remote';
-  
+
   return [
     {
       id: 'fallback1',
@@ -331,24 +331,24 @@ export async function deductCredits(userId: string): Promise<boolean> {
   try {
     const userRef = doc(db, 'users', userId);
     const userSnap = await getDoc(userRef);
-    
+
     if (!userSnap.exists()) return false;
-    
+
     const userData = userSnap.data();
     if (userData.credits <= 0) return false;
-    
+
     await updateDoc(userRef, {
       credits: increment(-1),
       updatedAt: serverTimestamp(),
     });
-    
+
     // Log usage
     await setDoc(doc(collection(db, 'usage')), {
       userId,
       type: 'job_search',
       timestamp: serverTimestamp(),
     });
-    
+
     return true;
   } catch (error) {
     console.error('Credit deduction error:', error);

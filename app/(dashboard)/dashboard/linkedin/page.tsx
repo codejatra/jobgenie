@@ -2,10 +2,10 @@
 
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { 
-  Briefcase, 
-  Sparkles, 
-  CheckCircle, 
+import {
+  Briefcase,
+  Sparkles,
+  CheckCircle,
   AlertCircle,
   TrendingUp,
   Users,
@@ -33,17 +33,17 @@ export default function LinkedInOptimizerPage() {
 
   const analyzeProfile = async () => {
     const content = inputMode === 'url' ? linkedinUrl : profileText;
-    
+
     if (!content) {
       toast.error(`Please enter your LinkedIn ${inputMode === 'url' ? 'URL' : 'profile content'}`);
       return;
     }
 
     setAnalyzing(true);
-    
+
     try {
       const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-      
+
       const prompt = `
         Analyze this LinkedIn profile and provide optimization suggestions:
         ${inputMode === 'url' ? `URL: ${content}` : `Profile Content: ${content}`}
@@ -62,11 +62,11 @@ export default function LinkedInOptimizerPage() {
           "tips": ["tip1", "tip2", ...]
         }
       `;
-      
+
       const result = await model.generateContent(prompt);
       const response = await result.response;
       const text = response.text();
-      
+
       try {
         // Clean and parse JSON
         const cleanedText = text.replace(/```json\n?/gi, '').replace(/```\n?/gi, '').trim();
@@ -129,21 +129,19 @@ export default function LinkedInOptimizerPage() {
               <div className="flex space-x-1 bg-gray-900/50 rounded-lg p-1">
                 <button
                   onClick={() => setInputMode('url')}
-                  className={`flex-1 py-2 px-4 rounded-lg font-medium transition-all ${
-                    inputMode === 'url'
-                      ? 'bg-purple-600 text-white'
-                      : 'text-gray-400 hover:text-white'
-                  }`}
+                  className={`flex-1 py-2 px-4 rounded-lg font-medium transition-all ${inputMode === 'url'
+                    ? 'bg-purple-600 text-white'
+                    : 'text-gray-400 hover:text-white'
+                    }`}
                 >
                   Profile URL
                 </button>
                 <button
                   onClick={() => setInputMode('text')}
-                  className={`flex-1 py-2 px-4 rounded-lg font-medium transition-all ${
-                    inputMode === 'text'
-                      ? 'bg-purple-600 text-white'
-                      : 'text-gray-400 hover:text-white'
-                  }`}
+                  className={`flex-1 py-2 px-4 rounded-lg font-medium transition-all ${inputMode === 'text'
+                    ? 'bg-purple-600 text-white'
+                    : 'text-gray-400 hover:text-white'
+                    }`}
                 >
                   Paste Content
                 </button>
@@ -222,39 +220,35 @@ export default function LinkedInOptimizerPage() {
                 <h2 className="text-xl font-bold text-white mb-4">Profile Strength</h2>
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center space-x-3">
-                    <div className={`w-20 h-20 rounded-full flex items-center justify-center ${
-                      analysis.score >= 80 ? 'bg-green-500/20' :
+                    <div className={`w-20 h-20 rounded-full flex items-center justify-center ${analysis.score >= 80 ? 'bg-green-500/20' :
                       analysis.score >= 60 ? 'bg-yellow-500/20' : 'bg-red-500/20'
-                    }`}>
-                      <span className={`text-2xl font-bold ${
-                        analysis.score >= 80 ? 'text-green-500' :
-                        analysis.score >= 60 ? 'text-yellow-500' : 'text-red-500'
                       }`}>
+                      <span className={`text-2xl font-bold ${analysis.score >= 80 ? 'text-green-500' :
+                        analysis.score >= 60 ? 'text-yellow-500' : 'text-red-500'
+                        }`}>
                         {analysis.score}
                       </span>
                     </div>
                     <div>
                       <p className="text-white font-semibold">
                         {analysis.score >= 80 ? 'Excellent' :
-                         analysis.score >= 60 ? 'Good' : 'Needs Improvement'}
+                          analysis.score >= 60 ? 'Good' : 'Needs Improvement'}
                       </p>
                       <p className="text-gray-400 text-sm">Profile Score</p>
                     </div>
                   </div>
-                  <Award className={`w-8 h-8 ${
-                    analysis.score >= 80 ? 'text-green-500' :
+                  <Award className={`w-8 h-8 ${analysis.score >= 80 ? 'text-green-500' :
                     analysis.score >= 60 ? 'text-yellow-500' : 'text-red-500'
-                  }`} />
+                    }`} />
                 </div>
                 <div className="w-full bg-gray-700 rounded-full h-2">
                   <motion.div
                     initial={{ width: 0 }}
                     animate={{ width: `${analysis.score}%` }}
                     transition={{ duration: 1, ease: "easeOut" }}
-                    className={`h-2 rounded-full ${
-                      analysis.score >= 80 ? 'bg-green-500' :
+                    className={`h-2 rounded-full ${analysis.score >= 80 ? 'bg-green-500' :
                       analysis.score >= 60 ? 'bg-yellow-500' : 'bg-red-500'
-                    }`}
+                      }`}
                   />
                 </div>
               </div>
