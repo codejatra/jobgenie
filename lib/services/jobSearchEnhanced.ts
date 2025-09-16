@@ -981,6 +981,77 @@ function filterQualityJobs(jobs: EnhancedJobListing[]): EnhancedJobListing[] {
     });
 }
 
+
+
+// Add date extraction and checking function
+function extractJobDate(text: string): Date | null {
+    if (!text) return null;
+    
+    // Common date patterns in job postings
+    const patterns = [
+        /posted\s+today/i,
+        /posted\s+(\d+)\s+hour[s]?\s+ago/i,
+        /posted\s+yesterday/i,
+        /posted\s+(\d+)\s+day[s]?\s+ago/i,
+        /posted\s+(\d+)\s+week[s]?\s+ago/i,
+        /posted\s+(\d+)\s+month[s]?\s+ago/i,
+        /(\d{1,2}\/\d{1,2}\/\d{2,4})/,
+        /(\d{1,2})-(\d{1,2})-(\d{2,4})/
+    ];
+    
+    const now = new Date();
+    
+    // Check for "today"
+    if (/today/i.test(text)) {
+        return now;
+    }
+    
+    // Check for "yesterday"
+    if (/yesterday/i.test(text)) {
+        const yesterday = new Date(now);
+        yesterday.setDate(yesterday.getDate() - 1);
+        return yesterday;
+    }
+    
+    // Check for "X hours ago"
+    const hoursMatch = text.match(/(\d+)\s+hour[s]?\s+ago/i);
+    if (hoursMatch) {
+        const hours = parseInt(hoursMatch[1]);
+        const date = new Date(now);
+        date.setHours(date.getHours() - hours);
+        return date;
+    }
+    
+    // Check for "X days ago"
+    const daysMatch = text.match(/(\d+)\s+day[s]?\s+ago/i);
+    if (daysMatch) {
+        const days = parseInt(daysMatch[1]);
+        if (days > 4) return null; // Too old
+        const date = new Date(now);
+        date.setDate(date.getDate() - days);
+        return date;
+    }
+    
+    // Check for "X weeks ago"
+    const weeksMatch = text.match(/(\d+)\s+week[s]?\s+ago/i);
+    if (weeksMatch) {
+        const weeks = parseInt(weeksMatch[1]);
+        if (weeks >= 1) return null; // More than a week is too old
+        const date = new Date(now);
+        date.setDate(date.getDate() - (weeks * 7));
+        return date;
+    }
+    
+    // If months or no date found, consider it too old
+    if (/month[s]?\s+ago/i.test(text)) {
+        return null;
+    }
+    
+    return null; // No date found or too old
+}
+
+
+// Update processJobResult to check dates
 async function processJobResult(
     result: any,
     refinements: SearchRefinements
@@ -988,6 +1059,17 @@ async function processJobResult(
     const jobs: EnhancedJobListing[] = [];
     
     try {
+        // Check date in search result snippet first
+        const snippetDate = extractJobDate(result.snippet || '');
+        const titleDate = extractJobDate(result.title || '');
+        
+        // If we can detect it's old from the snippet, skip it
+        if ((snippetDate === null && result.snippet?.includes('ago')) || 
+            (titleDate === null && result.title?.includes('ago'))) {
+            console.log('Skipping old job from snippet:', result.title);
+            return [];
+        }
+        
         // Skip obviously non-job URLs
         const url = result.link?.toLowerCase() || '';
         if (url.includes('/search?') || 
@@ -1000,23 +1082,12 @@ async function processJobResult(
         // Call cloud function to scrape the page
         const scraped = await fetchJobPageContent(result.link);
         
-        if (!scraped) {
-            console.log('No scraped data for:', result.link);
-            return [];
-        }
-
-        // Skip if scraping failed
-        if (scraped.error) {
-            // Don't log proxy errors - they're expected
-            if (!scraped.error.includes('Proxy')) {
-                console.error('Scraping error:', scraped.error);
-            }
+        if (!scraped || scraped.error) {
             return [];
         }
 
         // Handle job list
         if (scraped.type === 'list' && scraped.jobs && scraped.jobs.length > 0) {
-            // Process only first 3 jobs from list to avoid too many duplicates
             for (const jobInfo of scraped.jobs.slice(0, 3)) {
                 if (jobInfo.url) {
                     const jobPageData = await fetchJobPageContent(jobInfo.url);
@@ -1027,7 +1098,17 @@ async function processJobResult(
                             jobInfo.url, 
                             refinements
                         );
+                        
+                        // Check job date
                         if (structuredJob) {
+                            const jobDate = extractJobDate(jobPageData.job.description || '');
+                            if (jobDate === null && jobPageData.job.description?.includes('ago')) {
+                                console.log('Skipping old job:', structuredJob.title);
+                                continue;
+                            }
+                            
+                            // Set proper posted date
+                            structuredJob.postedDate = jobDate || new Date();
                             jobs.push(structuredJob);
                         }
                     }
@@ -1036,9 +1117,15 @@ async function processJobResult(
         } 
         // Handle single job
         else if (scraped.type === 'single' && scraped.job) {
-            // Skip if job has no substantial data
             if (!scraped.job.title || !scraped.job.description || 
                 scraped.job.description.length < 50) {
+                return [];
+            }
+            
+            // Check if job is fresh
+            const jobDate = extractJobDate(scraped.job.description || '');
+            if (jobDate === null && scraped.job.description?.includes('ago')) {
+                console.log('Skipping old job:', scraped.job.title);
                 return [];
             }
             
@@ -1047,18 +1134,20 @@ async function processJobResult(
                 result.link, 
                 refinements
             );
+            
             if (structuredJob) {
+                structuredJob.postedDate = jobDate || new Date();
                 jobs.push(structuredJob);
             }
         }
         
         return jobs;
     } catch (error) {
-        // Silent fail - don't clutter console
         return [];
     }
 }
 
+// Update searchWithRefinements to focus on fresh jobs
 export async function searchWithRefinements(
     query: string,
     refinements: SearchRefinements
@@ -1068,15 +1157,25 @@ export async function searchWithRefinements(
         const allJobs: EnhancedJobListing[] = [];
         const processedUrls = new Set<string>();
         
-        // Simpler search queries
-        const searches = [
-            `${query} ${location} site:linkedin.com/jobs/view`,
-            `${query} ${location} site:indeed.com/viewjob`,
-            `${query} ${location} site:glassdoor.com/job-listing`,
-            `${query} ${location} careers`
+        // Add time-based search terms for fresher results
+        const freshTerms = [
+            'posted today',
+            'posted yesterday', 
+            'hiring now',
+            'urgently hiring',
+            'new'
         ];
         
-        console.log('Starting multi-source search...');
+        // Build searches with fresh job indicators
+        const searches = [
+            `${query} ${location} "posted today" OR "posted yesterday" site:linkedin.com/jobs/view`,
+            `${query} ${location} "urgently hiring" site:indeed.com/viewjob`,
+            `${query} ${location} "new" "hiring" site:glassdoor.com`,
+            `${query} ${location} "posted 1 day ago" OR "posted 2 days ago"`,
+            `${query} ${location} ${freshTerms[Math.floor(Math.random() * freshTerms.length)]}`
+        ];
+        
+        console.log('Searching for fresh jobs (max 4 days old)...');
         
         for (const searchQuery of searches) {
             try {
@@ -1084,7 +1183,9 @@ export async function searchWithRefinements(
                     'https://google.serper.dev/search',
                     { 
                         q: searchQuery,
-                        num: 8 // Fewer per source
+                        num: 10,
+                        // Add time range parameter if Serper supports it
+                        gl: 'us',
                     },
                     {
                         headers: {
@@ -1104,37 +1205,71 @@ export async function searchWithRefinements(
                     }
                     processedUrls.add(result.link);
                     
+                    // Check date in snippet before processing
+                    if (result.snippet) {
+                        const snippetLower = result.snippet.toLowerCase();
+                        // Skip if obviously old
+                        if (snippetLower.includes('week') && snippetLower.includes('ago')) {
+                            console.log('Skipping week old job');
+                            continue;
+                        }
+                        if (snippetLower.includes('month') && snippetLower.includes('ago')) {
+                            console.log('Skipping month old job');
+                            continue;
+                        }
+                        // Skip if more than 4 days
+                        const daysMatch = snippetLower.match(/(\d+)\s+days?\s+ago/);
+                        if (daysMatch && parseInt(daysMatch[1]) > 4) {
+                            console.log(`Skipping ${daysMatch[1]} days old job`);
+                            continue;
+                        }
+                    }
+                    
                     const jobs = await processJobResult(result, refinements);
                     allJobs.push(...jobs);
                     
-                    // Stop early if we have enough
-                    if (allJobs.length >= 30) break;
+                    if (allJobs.length >= 25) break;
                 }
                 
             } catch (error) {
-                console.error(`Search failed for: ${searchQuery.split('site:')[1]}`);
+                console.error(`Search failed for: ${searchQuery.split('site:')[1]?.split(' ')[0] || 'general'}`);
                 continue;
             }
             
-            if (allJobs.length >= 30) break;
+            if (allJobs.length >= 25) break;
         }
         
-        console.log(`Raw jobs found: ${allJobs.length}`);
+        console.log(`Found ${allJobs.length} fresh jobs`);
         
-        // Remove duplicates
-        let uniqueJobs = removeDuplicateJobs(allJobs);
-        console.log(`After deduplication: ${uniqueJobs.length}`);
+        // Final date filter
+        const freshJobs = allJobs.filter(job => {
+            const daysSincePosted = Math.floor(
+                (new Date().getTime() - new Date(job.postedDate).getTime()) / 
+                (1000 * 60 * 60 * 24)
+            );
+            return daysSincePosted <= 4; // Max 4 days old
+        });
         
-        // Filter for quality
+        console.log(`After date filter: ${freshJobs.length} jobs (max 4 days old)`);
+        
+        // Remove duplicates and filter quality
+        let uniqueJobs = removeDuplicateJobs(freshJobs);
         uniqueJobs = filterQualityJobs(uniqueJobs);
-        console.log(`After quality filter: ${uniqueJobs.length}`);
         
-        // Sort by match score
-        uniqueJobs.sort((a, b) => b.matchScore - a.matchScore);
+        // Sort by date (newest first) then by match score
+        uniqueJobs.sort((a, b) => {
+            // First sort by date
+            const dateA = new Date(a.postedDate).getTime();
+            const dateB = new Date(b.postedDate).getTime();
+            if (dateB !== dateA) {
+                return dateB - dateA; // Newer first
+            }
+            // Then by match score
+            return b.matchScore - a.matchScore;
+        });
         
-        // Return exactly what we show
         const finalJobs = uniqueJobs.slice(0, 20);
-        console.log(`Returning: ${finalJobs.length} jobs`);
+        console.log(`Returning ${finalJobs.length} fresh, quality jobs`);
         
         return finalJobs;
         
