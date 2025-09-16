@@ -2,11 +2,10 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
 import { JobListing } from './jobService';
 import { StoredResume } from './resumeService';
-import { httpsCallable } from 'firebase/functions';
+import { httpsCallable,getFunctions, connectFunctionsEmulator } from 'firebase/functions';
 import { functions } from '@/lib/firebase/config';
 const genAI = new GoogleGenerativeAI(process.env.NEXT_PUBLIC_GEMINI_API_KEY!);
 // Create reference to your cloud function
-const scrapeJobPageFunction = httpsCallable(functions, 'scrapeJobPage');
 
 export interface SearchRefinements {
     jobTitles: string[];
@@ -622,18 +621,6 @@ export async function performEnhancedSearch(
     return await searchWithRefinements(query, fullRefinements);
 }
 
-// Replace the fetchJobPageContent function with this:
-async function fetchJobPageContent(url: string): Promise<any> {
-    try {
-        console.log('Calling cloud function for:', url);
-        const result = await scrapeJobPageFunction({ url });
-        console.log('Cloud function response:', result.data);
-        return result.data;
-    } catch (error) {
-        console.error('Cloud function error:', error);
-        return null;
-    }
-}
 
 
 // Add this helper function for fallback:
@@ -1147,45 +1134,143 @@ async function processJobResult(
     }
 }
 
-// Update searchWithRefinements to focus on fresh jobs
+
+
+// latest playwrite
+
+// Update fetchJobPageContent to use Playwright function
+async function fetchJobPageContent(url: string): Promise<any> {
+  try {
+    console.log('🔍 Calling Playwright scraper for:', url);
+    
+    // Make sure the function name matches your deployed function
+    const scrapeJobsFunction = httpsCallable(functions, 'scrapeJobsWithPlaywright');
+    
+    const result = await scrapeJobsFunction({ url });
+    
+    console.log('✅ Playwright response received:', {
+      type: result.data,
+      jobCount: result.data || 0,
+      error: result.data
+    });
+    
+    return result.data;
+  } catch (error: any) {
+    console.error('❌ Playwright function error:', {
+      message: error.message,
+      code: error.code,
+      details: error.details
+    });
+    return null;
+  }
+}
+
+
+
+// Use Gemini to personalize jobs based on user prompt
+async function personalizeJobsWithGemini(
+    jobs: EnhancedJobListing[],
+    userPrompt: string,
+    refinements: SearchRefinements
+): Promise<EnhancedJobListing[]> {
+    try {
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+        
+        // Create job summaries for Gemini
+        const jobSummaries = jobs.map((job, idx) => ({
+            index: idx,
+            title: job.title,
+            company: job.company,
+            location: job.location,
+            description: job.description.substring(0, 200)
+        }));
+        
+        const prompt = `
+        User is looking for: "${userPrompt}"
+        Location preference: ${refinements.location?.city || 'Any'}
+        
+        Here are ${jobs.length} job opportunities. Rank them by relevance to the user's search.
+        
+        Jobs:
+        ${JSON.stringify(jobSummaries)}
+        
+        Return a JSON array of job indices ordered by best match first.
+        Also provide a match score (0-100) and reasons for each.
+        
+        Format:
+        [
+          {"index": 0, "score": 95, "reasons": ["Perfect title match", "Great location"]},
+          {"index": 1, "score": 85, "reasons": ["Good skills match"]}
+        ]
+        
+        Only return valid JSON array.
+        `;
+        
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text();
+        
+        const rankings = safeJsonParse(text);
+        
+        if (Array.isArray(rankings)) {
+            // Reorder jobs based on Gemini's personalized ranking
+            const personalizedJobs: EnhancedJobListing[] = [];
+            
+            for (const rank of rankings) {
+                if (rank.index >= 0 && rank.index < jobs.length) {
+                    const job = jobs[rank.index];
+                    job.matchScore = rank.score || 70;
+                    job.matchReasons = rank.reasons || [];
+                    personalizedJobs.push(job);
+                }
+            }
+            
+            return personalizedJobs;
+        }
+        
+        // Fallback: return original order with default scores
+        return jobs.map(job => ({
+            ...job,
+            matchScore: 70,
+            matchReasons: ['Relevant opportunity']
+        }));
+        
+    } catch (error) {
+        console.error('Personalization error:', error);
+        return jobs;
+    }
+}
+
+
+// Update searchWithRefinements with better logging
 export async function searchWithRefinements(
     query: string,
     refinements: SearchRefinements
 ): Promise<EnhancedJobListing[]> {
     try {
         const location = refinements.location?.city || '';
+        console.log('🚀 Starting search:', { query, location });
+        
         const allJobs: EnhancedJobListing[] = [];
         const processedUrls = new Set<string>();
         
-        // Add time-based search terms for fresher results
-        const freshTerms = [
-            'posted today',
-            'posted yesterday', 
-            'hiring now',
-            'urgently hiring',
-            'new'
-        ];
-        
-        // Build searches with fresh job indicators
+        // Simplified search queries for testing
         const searches = [
-            `${query} ${location} "posted today" OR "posted yesterday" site:linkedin.com/jobs/view`,
-            `${query} ${location} "urgently hiring" site:indeed.com/viewjob`,
-            `${query} ${location} "new" "hiring" site:glassdoor.com`,
-            `${query} ${location} "posted 1 day ago" OR "posted 2 days ago"`,
-            `${query} ${location} ${freshTerms[Math.floor(Math.random() * freshTerms.length)]}`
+            `${query} ${location} jobs`,
+            `${query} ${location} careers hiring`,
+            `${query} ${location} site:linkedin.com/jobs`,
+            `${query} ${location} site:indeed.com`
         ];
-        
-        console.log('Searching for fresh jobs (max 4 days old)...');
         
         for (const searchQuery of searches) {
+            console.log('🔎 Searching:', searchQuery);
+            
             try {
                 const serperResponse = await axios.post(
                     'https://google.serper.dev/search',
                     { 
                         q: searchQuery,
-                        num: 10,
-                        // Add time range parameter if Serper supports it
-                        gl: 'us',
+                        num: 10
                     },
                     {
                         headers: {
@@ -1197,84 +1282,119 @@ export async function searchWithRefinements(
                 );
 
                 const searchResults = serperResponse.data.organic || [];
+                console.log(`📋 Serper returned ${searchResults.length} results`);
                 
-                for (const result of searchResults) {
-                    // Skip if already processed
+                // Log first few results for debugging
+                searchResults.slice(0, 3).forEach((result: any) => {
+                    console.log('  - ', result.title);
+                    console.log('    URL:', result.link);
+                });
+                
+                for (const result of searchResults.slice(0, 5)) { // Process first 5 for testing
                     if (processedUrls.has(result.link)) {
+                        console.log('⏭️ Skipping duplicate:', result.link);
                         continue;
                     }
+                    
                     processedUrls.add(result.link);
                     
-                    // Check date in snippet before processing
-                    if (result.snippet) {
-                        const snippetLower = result.snippet.toLowerCase();
-                        // Skip if obviously old
-                        if (snippetLower.includes('week') && snippetLower.includes('ago')) {
-                            console.log('Skipping week old job');
-                            continue;
-                        }
-                        if (snippetLower.includes('month') && snippetLower.includes('ago')) {
-                            console.log('Skipping month old job');
-                            continue;
-                        }
-                        // Skip if more than 4 days
-                        const daysMatch = snippetLower.match(/(\d+)\s+days?\s+ago/);
-                        if (daysMatch && parseInt(daysMatch[1]) > 4) {
-                            console.log(`Skipping ${daysMatch[1]} days old job`);
-                            continue;
-                        }
-                    }
+                    console.log('🔄 Processing:', result.title);
+                    const jobs = await processJobWithPlaywright(result, refinements);
                     
-                    const jobs = await processJobResult(result, refinements);
+                    console.log(`  ✅ Got ${jobs.length} jobs from this URL`);
                     allJobs.push(...jobs);
                     
-                    if (allJobs.length >= 25) break;
+                    if (allJobs.length >= 10) break; // Lower threshold for testing
                 }
                 
-            } catch (error) {
-                console.error(`Search failed for: ${searchQuery.split('site:')[1]?.split(' ')[0] || 'general'}`);
-                continue;
+            } catch (error: any) {
+                console.error(`❌ Search failed:`, error.message);
             }
             
-            if (allJobs.length >= 25) break;
+            if (allJobs.length >= 10) break;
         }
         
-        console.log(`Found ${allJobs.length} fresh jobs`);
+        console.log(`📊 Total jobs found: ${allJobs.length}`);
         
-        // Final date filter
-        const freshJobs = allJobs.filter(job => {
-            const daysSincePosted = Math.floor(
-                (new Date().getTime() - new Date(job.postedDate).getTime()) / 
-                (1000 * 60 * 60 * 24)
-            );
-            return daysSincePosted <= 4; // Max 4 days old
-        });
+        if (allJobs.length === 0) {
+            console.error('🚨 No jobs found - check the following:');
+            console.error('1. Is Serper API working?');
+            console.error('2. Is Playwright function deployed?');
+            console.error('3. Are jobs being scraped?');
+        }
         
-        console.log(`After date filter: ${freshJobs.length} jobs (max 4 days old)`);
+        // Remove duplicates and filter
+        const uniqueJobs = removeDuplicateJobs(allJobs);
+        const qualityJobs = filterQualityJobs(uniqueJobs);
         
-        // Remove duplicates and filter quality
-        let uniqueJobs = removeDuplicateJobs(freshJobs);
-        uniqueJobs = filterQualityJobs(uniqueJobs);
+        console.log(`✨ Final jobs after filtering: ${qualityJobs.length}`);
         
-        // Sort by date (newest first) then by match score
-        uniqueJobs.sort((a, b) => {
-            // First sort by date
-            const dateA = new Date(a.postedDate).getTime();
-            const dateB = new Date(b.postedDate).getTime();
-            if (dateB !== dateA) {
-                return dateB - dateA; // Newer first
+        return qualityJobs.slice(0, 20);
+        
+    } catch (error: any) {
+        console.error('💥 Search error:', error);
+        return [];
+    }
+}
+
+// Update processJobWithPlaywright with logging
+async function processJobWithPlaywright(
+    result: any,
+    refinements: SearchRefinements
+): Promise<EnhancedJobListing[]> {
+    const jobs: EnhancedJobListing[] = [];
+    
+    try {
+        console.log('  🌐 Scraping:', result.link);
+        
+        // Call Playwright cloud function
+        const scraped = await fetchJobPageContent(result.link);
+        
+        if (!scraped) {
+            console.log('  ❌ No data returned from scraper');
+            return [];
+        }
+        
+        if (scraped.error) {
+            console.log('  ⚠️ Scraping error:', scraped.error);
+            return [];
+        }
+        
+        console.log(`  📦 Scraped data type: ${scraped.type}, Jobs: ${scraped.jobs?.length || 0}`);
+        
+        // Process the scraped jobs
+        if (scraped.jobs && scraped.jobs.length > 0) {
+            for (const jobData of scraped.jobs) {
+                // Check if job has minimum required data
+                if (!jobData.title || !jobData.description) {
+                    console.log('  ⏭️ Skipping job - missing title or description');
+                    continue;
+                }
+                
+                console.log(`  🔧 Processing job: ${jobData.title} at ${jobData.company}`);
+                
+                // Structure with Gemini
+                const structuredJob = await structureJobWithGemini(
+                    jobData,
+                    jobData.url || result.link,
+                    refinements
+                );
+                
+                if (structuredJob) {
+                    jobs.push(structuredJob);
+                    console.log('  ✅ Job added successfully');
+                } else {
+                    console.log('  ❌ Failed to structure job');
+                }
             }
-            // Then by match score
-            return b.matchScore - a.matchScore;
-        });
+        } else {
+            console.log('  ⚠️ No jobs in scraped data');
+        }
         
-        const finalJobs = uniqueJobs.slice(0, 20);
-        console.log(`Returning ${finalJobs.length} fresh, quality jobs`);
+        return jobs;
         
-        return finalJobs;
-        
-    } catch (error) {
-        console.error('Search error:', error);
+    } catch (error: any) {
+        console.error('  💥 Process job error:', error.message);
         return [];
     }
 }
