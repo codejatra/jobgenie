@@ -60,7 +60,6 @@ export default function Dashboard() {
 
   // Pagination
   const [currentPage, setCurrentPage] = useState(1);
-  const jobsPerPage = 10;
 
 
 
@@ -245,10 +244,15 @@ export default function Dashboard() {
   };
 
   // Pagination
-  const indexOfLastJob = currentPage * jobsPerPage;
-  const indexOfFirstJob = indexOfLastJob - jobsPerPage;
-  const currentJobs = jobs.slice(indexOfFirstJob, indexOfLastJob);
-  const totalPages = Math.ceil(jobs.length / jobsPerPage);
+
+
+  // Fix the pagination display
+const jobsPerPage = 10;
+const indexOfLastJob = currentPage * jobsPerPage;
+const indexOfFirstJob = indexOfLastJob - jobsPerPage;
+const currentJobs = jobs.slice(indexOfFirstJob, indexOfLastJob);
+const totalPages = Math.ceil(jobs.length / jobsPerPage);
+
 
   if (loading) {
     return (

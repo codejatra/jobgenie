@@ -54,8 +54,16 @@ export interface EnhancedJobListing extends JobListing {
     };
 }
 
+// Add at the top with other interfaces
+interface JobSignature {
+    title: string;
+    company: string;
+    location: string;
+}
+
 
 // Analyze prompt or resume for missing information
+// Fix analyzeSearchIntent to properly detect missing info
 export async function analyzeSearchIntent(
     input: string,
     isResume: boolean = false
@@ -65,45 +73,85 @@ export async function analyzeSearchIntent(
     suggestions: string[];
 }> {
     try {
+        // Check for basic required information
+        const hasLocation = /\b(remote|hybrid|onsite|[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b/.test(input);
+        const hasJobTitle = input.split(' ').length > 1;
+        const hasSalary = /\$|\d+k/i.test(input);
+        
+        // Determine what's missing
+        const missingInfo: string[] = [];
+        if (!hasJobTitle) missingInfo.push('Specific job title or role');
+        if (!hasLocation) missingInfo.push('Location preference (city or remote)');
+        if (!hasSalary) missingInfo.push('Salary expectations (optional)');
+        
+        // If critical info is missing, return with missingInfo
+        if (missingInfo.length > 0 && !isResume) {
+            return {
+                refinements: {
+                    jobTitles: [],
+                    synonyms: [],
+                    location: {},
+                    seniority: 'mid',
+                    mustHaveSkills: [],
+                    niceToHaveSkills: [],
+                    salary: {},
+                    contractType: 'full-time',
+                    eligibility: { languages: ['English'] },
+                    dateRange: 3,
+                    exclusions: {},
+                    targetCompanies: []
+                },
+                missingInfo,
+                suggestions: [
+                    'Add specific job title (e.g., "Senior React Developer")',
+                    'Include location or mention if remote is okay',
+                    'Specify experience level (junior/mid/senior)'
+                ]
+            };
+        }
+        
+        // Try to extract with Gemini
         const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-
+        
         const prompt = `
-    Analyze this ${isResume ? 'resume' : 'job search prompt'} and extract search parameters.
-    
-    Input: ${input.substring(0, 2000)}
-    
-    Return ONLY a valid JSON object (no markdown, no extra text):
-    {
-      "refinements": {
-        "jobTitles": [],
-        "synonyms": [],
-        "location": {"city": "", "remote": false, "hybrid": false},
-        "seniority": "mid",
-        "mustHaveSkills": [],
-        "niceToHaveSkills": [],
-        "salary": {"min": 0, "max": 0, "currency": "USD"},
-        "contractType": "full-time",
-        "eligibility": {"languages": ["English"]},
-        "dateRange": 3,
-        "exclusions": {},
-        "targetCompanies": []
-      },
-      "missingInfo": [],
-      "suggestions": []
-    }
-    `;
-
+        Extract search parameters from: "${input}"
+        
+        Return JSON:
+        {
+            "refinements": {
+                "jobTitles": ["extracted titles"],
+                "location": {"city": "extracted city or Remote"},
+                "seniority": "junior/mid/senior",
+                "mustHaveSkills": ["skill1", "skill2"],
+                "salary": {"min": 0, "max": 0},
+                "contractType": "full-time",
+                "dateRange": 3
+            },
+            "missingInfo": ["what's missing"],
+            "suggestions": ["helpful suggestions"]
+        }
+        `;
+        
         const result = await model.generateContent(prompt);
         const response = await result.response;
         const text = response.text();
-
+        
         const parsed = safeJsonParse(text);
-
-        if (parsed) {
+        
+        // Ensure missingInfo is populated if key data is missing
+        if (parsed && parsed.refinements) {
+            if (!parsed.refinements.jobTitles?.length) {
+                parsed.missingInfo = parsed.missingInfo || [];
+                parsed.missingInfo.push('Specific job title');
+            }
+            if (!parsed.refinements.location?.city) {
+                parsed.missingInfo = parsed.missingInfo || [];
+                parsed.missingInfo.push('Location preference');
+            }
             return parsed;
         }
-
-        // Fallback
+        
+        // Fallback with missingInfo
         return {
             refinements: {
                 jobTitles: [],
@@ -120,10 +168,13 @@ export async function analyzeSearchIntent(
                 targetCompanies: []
             },
             missingInfo: ['Job title', 'Location preference'],
-            suggestions: ['Specify desired role', 'Add location or remote preference']
+            suggestions: ['Be specific about the role', 'Add your preferred location']
         };
+        
     } catch (error) {
-        console.error('Search intent analysis error:', error);
+        console.error('Intent analysis error:', error);
+        
+        // Always return with missingInfo to trigger refinement popup
         return {
             refinements: {
                 jobTitles: [],
@@ -139,8 +190,8 @@ export async function analyzeSearchIntent(
                 exclusions: {},
                 targetCompanies: []
             },
-            missingInfo: [],
-            suggestions: []
+            missingInfo: ['Job title', 'Location preference', 'Experience level'],
+            suggestions: ['Add specific job title', 'Specify location or remote', 'Include experience level']
         };
     }
 }
@@ -179,85 +230,7 @@ function buildSearchQuery(refinements: SearchRefinements): string {
 
 
 // Update processJobResult to handle the cloud function response:
-async function processJobResult(
-    result: any,
-    refinements: SearchRefinements
-): Promise<EnhancedJobListing[]> {
-    const jobs: EnhancedJobListing[] = [];
 
-    try {
-        // Call cloud function to scrape the page
-        const scraped = await fetchJobPageContent(result.link);
-
-        if (!scraped) {
-            console.log('No scraped data, using snippet');
-            const fallbackJob = await createJobFromSnippet(result, refinements);
-            if (fallbackJob) return [fallbackJob];
-            return [];
-        }
-
-        // Handle error response
-        if (scraped.error) {
-            console.error('Scraping error:', scraped.error);
-            const fallbackJob = await createJobFromSnippet(result, refinements);
-            if (fallbackJob) return [fallbackJob];
-            return [];
-        }
-
-        // Handle job list (multiple jobs from one URL)
-        if (scraped.type === 'list' && scraped.jobs && scraped.jobs.length > 0) {
-            console.log(`Found ${scraped.jobs.length} jobs from list page`);
-
-            // Process each job from the list
-            for (const jobInfo of scraped.jobs.slice(0, 5)) { // Max 5 jobs per list
-                if (jobInfo.url) {
-                    // Scrape individual job page
-                    const jobPageData = await fetchJobPageContent(jobInfo.url);
-
-                    if (jobPageData && jobPageData.type === 'single' && jobPageData.job) {
-                        const structuredJob = await structureJobWithGemini(
-                            jobPageData.job,
-                            jobInfo.url,
-                            refinements
-                        );
-                        if (structuredJob) {
-                            jobs.push(structuredJob);
-                        }
-                    } else {
-                        // Use list data if individual scraping fails
-                        const structuredJob = await structureJobWithGemini(
-                            jobInfo,
-                            jobInfo.url,
-                            refinements
-                        );
-                        if (structuredJob) {
-                            jobs.push(structuredJob);
-                        }
-                    }
-                }
-            }
-        }
-        // Handle single job
-        else if (scraped.type === 'single' && scraped.job) {
-            console.log('Processing single job page');
-            const structuredJob = await structureJobWithGemini(
-                scraped.job,
-                result.link,
-                refinements
-            );
-            if (structuredJob) {
-                jobs.push(structuredJob);
-            }
-        }
-
-        return jobs;
-    } catch (error) {
-        console.error('Process job error:', error);
-        const fallbackJob = await createJobFromSnippet(result, refinements);
-        if (fallbackJob) return [fallbackJob];
-        return [];
-    }
-}
 
 
 // Helper functions
@@ -338,11 +311,6 @@ function generateDefaultResponsibilities(title: string): string[] {
     ];
 }
 
-function generateJobId(url: string): string {
-    const timestamp = Date.now();
-    const urlHash = url.replace(/[^a-zA-Z0-9]/g, '').substring(0, 8);
-    return `job_${urlHash}_${timestamp}`;
-}
 
 // Generate interview questions (Fixed to return string array)
 export async function generateInterviewQuestions(job: JobListing): Promise<string[]> {
@@ -509,18 +477,45 @@ export async function generateSalaryNegotiation(
 }
 
 // Search jobs from resume
+// Fix searchJobsFromResume to work properly
 export async function searchJobsFromResume(
     resume: StoredResume,
     additionalFilters?: Partial<SearchRefinements>
 ): Promise<EnhancedJobListing[]> {
     try {
-        const { refinements } = await analyzeSearchIntent(resume.extractedText || '', true);
-        const finalRefinements = { ...refinements, ...additionalFilters };
-        const searchQuery = buildSearchQuery(finalRefinements);
+        if (!resume.extractedText) {
+            console.error('No resume text available');
+            return [];
+        }
 
+        // Extract key information from resume
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+        const prompt = `
+        Extract job search parameters from this resume:
+        ${resume.extractedText.substring(0, 2000)}
+        
+        Return a simple search query (not JSON), like:
+        "Software Engineer San Francisco React Node.js"
+        
+        Include: job title, skills, and preferred location if mentioned.
+        `;
+
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const searchQuery = response.text().trim();
+
+        console.log('Resume search query:', searchQuery);
+
+        // Analyze for refinements
+        const { refinements } = await analyzeSearchIntent(searchQuery, false);
+        const finalRefinements = { ...refinements, ...additionalFilters };
+
+        // Search with the extracted query
         return await searchWithRefinements(searchQuery, finalRefinements);
+
     } catch (error) {
-        console.error('Resume-based search error:', error);
+        console.error('Resume search error:', error);
         return [];
     }
 }
@@ -685,75 +680,17 @@ async function createJobFromSnippet(
 }
 
 // Update searchWithRefinements to handle multiple jobs per result:
-export async function searchWithRefinements(
-    query: string,
-    refinements: SearchRefinements
-): Promise<EnhancedJobListing[]> {
-    try {
-        const searchQuery = `${query} jobs ${refinements.location?.city || ''}`.trim();
-
-        console.log('Searching for:', searchQuery);
-
-        const serperResponse = await axios.post(
-            'https://google.serper.dev/search',
-            {
-                q: searchQuery,
-                num: 15 // Fewer results since each might expand to multiple jobs
-            },
-            {
-                headers: {
-                    'X-API-KEY': process.env.NEXT_PUBLIC_SERPER_API_KEY!,
-                    'Content-Type': 'application/json',
-                }
-            }
-        );
-
-        const searchResults = serperResponse.data.organic || [];
-        console.log(`Got ${searchResults.length} search results`);
-
-        const allJobs: EnhancedJobListing[] = [];
-
-        // Process each search result
-        for (const result of searchResults.slice(0, 10)) {
-            console.log('Processing:', result.title);
-
-            // Skip non-job URLs
-            const url = result.link?.toLowerCase() || '';
-            if (url.includes('/search?') || url.includes('?q=')) {
-                console.log('Skipping search page:', url);
-                continue;
-            }
-
-            const jobs = await processJobResult(result, refinements);
-            allJobs.push(...jobs);
-
-            // Stop if we have enough jobs
-            if (allJobs.length >= 25) break;
-        }
-
-        console.log(`Total jobs found: ${allJobs.length}`);
-
-        // Sort by match score
-        allJobs.sort((a, b) => b.matchScore - a.matchScore);
-
-        // Return max 25 jobs
-        return allJobs.slice(0, 25);
-    } catch (error) {
-        console.error('Search error:', error);
-        return [];
-    }
-}
+// Update searchWithRefinements to search multiple sites
 
 
 
-// new
 
-// Fix safeJsonParse to handle Gemini responses better
+// CRITICAL: This version returns proper fallback for refinement
 function safeJsonParse(text: string): any {
     if (!text) return null;
 
     try {
-        // Remove any markdown formatting
+        // Clean the text
         let cleaned = text
             .replace(/```(?:json)?\s*/gi, '')
             .replace(/\n/g, ' ')
@@ -764,7 +701,27 @@ function safeJsonParse(text: string): any {
         // Find JSON structure
         const jsonMatch = cleaned.match(/\{.*\}/) || cleaned.match(/\[.*\]/);
         if (!jsonMatch) {
-            console.log('No JSON structure found');
+            // For refinement analysis, return default structure
+            if (text.includes('refinements')) {
+                return {
+                    refinements: {
+                        jobTitles: [],
+                        synonyms: [],
+                        location: { remote: true },
+                        seniority: 'mid',
+                        mustHaveSkills: [],
+                        niceToHaveSkills: [],
+                        salary: {},
+                        contractType: 'full-time',
+                        eligibility: { languages: ['English'] },
+                        dateRange: 3,
+                        exclusions: {},
+                        targetCompanies: []
+                    },
+                    missingInfo: ['Job title or role', 'Location preference'],
+                    suggestions: ['Add specific job title', 'Specify location']
+                };
+            }
             return null;
         }
 
@@ -772,15 +729,35 @@ function safeJsonParse(text: string): any {
 
         // Fix common issues
         jsonStr = jsonStr
-            .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":') // Quote keys
-            .replace(/:\s*'([^']*)'/g, ':"$1"') // Single to double quotes
-            .replace(/,\s*([}\]])/g, '$1') // Remove trailing commas
-            .replace(/:\s*undefined/g, ':null') // Replace undefined with null
-            .replace(/:\s*None/g, ':null'); // Replace Python None with null
+            .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
+            .replace(/:\s*'([^']*)'/g, ':"$1"')
+            .replace(/,\s*([}\]])/g, '$1')
+            .replace(/:\s*undefined/g, ':null');
 
         return JSON.parse(jsonStr);
     } catch (e) {
-        // Return null silently - we'll handle it in the calling function
+        // Special handling for refinement responses
+        if (text.includes('refinements') || text.includes('missingInfo')) {
+            console.log('Refinement parse failed, using defaults');
+            return {
+                refinements: {
+                    jobTitles: [],
+                    synonyms: [],
+                    location: { remote: true },
+                    seniority: 'mid',
+                    mustHaveSkills: [],
+                    niceToHaveSkills: [],
+                    salary: {},
+                    contractType: 'full-time',
+                    eligibility: { languages: ['English'] },
+                    dateRange: 3,
+                    exclusions: {},
+                    targetCompanies: []
+                },
+                missingInfo: ['Job title', 'Location', 'Experience level'],
+                suggestions: ['Specify the role you want', 'Add your preferred location']
+            };
+        }
         return null;
     }
 }
@@ -925,4 +902,244 @@ function extractListFromText(text: string, type: string): string[] | null {
     }
 
     return items.length > 0 ? items : null;
+}
+
+
+// Add deduplication function
+// Improved deduplication with better matching
+function removeDuplicateJobs(jobs: EnhancedJobListing[]): EnhancedJobListing[] {
+    const uniqueJobs = new Map<string, EnhancedJobListing>();
+    const seenTitles = new Set<string>();
+    
+    for (const job of jobs) {
+        // Skip jobs with insufficient data
+        if (!job.title || !job.company || job.title === 'Job Opening') {
+            continue;
+        }
+        
+        // Skip if description is too short (likely fake/incomplete)
+        if (!job.description || job.description.length < 100) {
+            continue;
+        }
+        
+        // Create multiple signatures for better duplicate detection
+        const titleCompany = `${job.title.toLowerCase().trim()}_${job.company.toLowerCase().trim()}`;
+        const titleLocation = `${job.title.toLowerCase().trim()}_${job.location?.toLowerCase().trim()}`;
+        
+        // Skip if we've seen this job
+        if (seenTitles.has(titleCompany) || seenTitles.has(titleLocation)) {
+            continue;
+        }
+        
+        // Add to unique jobs
+        seenTitles.add(titleCompany);
+        uniqueJobs.set(job.id, job);
+    }
+    
+    return Array.from(uniqueJobs.values());
+}
+
+// Better unique ID generation
+function generateJobId(url: string): string {
+    // Create more unique ID using URL hash and random component
+    const urlHash = url.split('/').pop()?.replace(/[^a-zA-Z0-9]/g, '') || 'job';
+    const randomPart = Math.random().toString(36).substring(2, 8);
+    return `job_${urlHash}_${randomPart}_${Date.now()}`;
+}
+
+
+// Filter out low-quality jobs
+function filterQualityJobs(jobs: EnhancedJobListing[]): EnhancedJobListing[] {
+    return jobs.filter(job => {
+        // Must have essential fields
+        if (!job.title || !job.company || !job.description) {
+            return false;
+        }
+        
+        // Title should be meaningful
+        if (job.title.length < 5 || job.title === 'Job Opening') {
+            return false;
+        }
+        
+        // Company name should be reasonable
+        if (job.company === 'Company' || job.company.length < 2) {
+            return false;
+        }
+        
+        // Description should have substance
+        if (job.description.length < 100 || job.description.includes('Please visit the job page')) {
+            return false;
+        }
+        
+        // Should have at least some requirements/responsibilities
+        if ((!job.requirements || job.requirements.length === 0) && 
+            (!job.responsibilities || job.responsibilities.length === 0)) {
+            return false;
+        }
+        
+        return true;
+    });
+}
+
+async function processJobResult(
+    result: any,
+    refinements: SearchRefinements
+): Promise<EnhancedJobListing[]> {
+    const jobs: EnhancedJobListing[] = [];
+    
+    try {
+        // Skip obviously non-job URLs
+        const url = result.link?.toLowerCase() || '';
+        if (url.includes('/search?') || 
+            url.includes('?q=') || 
+            url.includes('job-search') ||
+            url.includes('browse-jobs')) {
+            return [];
+        }
+        
+        // Call cloud function to scrape the page
+        const scraped = await fetchJobPageContent(result.link);
+        
+        if (!scraped) {
+            console.log('No scraped data for:', result.link);
+            return [];
+        }
+
+        // Skip if scraping failed
+        if (scraped.error) {
+            // Don't log proxy errors - they're expected
+            if (!scraped.error.includes('Proxy')) {
+                console.error('Scraping error:', scraped.error);
+            }
+            return [];
+        }
+
+        // Handle job list
+        if (scraped.type === 'list' && scraped.jobs && scraped.jobs.length > 0) {
+            // Process only first 3 jobs from list to avoid too many duplicates
+            for (const jobInfo of scraped.jobs.slice(0, 3)) {
+                if (jobInfo.url) {
+                    const jobPageData = await fetchJobPageContent(jobInfo.url);
+                    
+                    if (jobPageData && jobPageData.type === 'single' && jobPageData.job) {
+                        const structuredJob = await structureJobWithGemini(
+                            jobPageData.job, 
+                            jobInfo.url, 
+                            refinements
+                        );
+                        if (structuredJob) {
+                            jobs.push(structuredJob);
+                        }
+                    }
+                }
+            }
+        } 
+        // Handle single job
+        else if (scraped.type === 'single' && scraped.job) {
+            // Skip if job has no substantial data
+            if (!scraped.job.title || !scraped.job.description || 
+                scraped.job.description.length < 50) {
+                return [];
+            }
+            
+            const structuredJob = await structureJobWithGemini(
+                scraped.job, 
+                result.link, 
+                refinements
+            );
+            if (structuredJob) {
+                jobs.push(structuredJob);
+            }
+        }
+        
+        return jobs;
+    } catch (error) {
+        // Silent fail - don't clutter console
+        return [];
+    }
+}
+
+export async function searchWithRefinements(
+    query: string,
+    refinements: SearchRefinements
+): Promise<EnhancedJobListing[]> {
+    try {
+        const location = refinements.location?.city || '';
+        const allJobs: EnhancedJobListing[] = [];
+        const processedUrls = new Set<string>();
+        
+        // Simpler search queries
+        const searches = [
+            `${query} ${location} site:linkedin.com/jobs/view`,
+            `${query} ${location} site:indeed.com/viewjob`,
+            `${query} ${location} site:glassdoor.com/job-listing`,
+            `${query} ${location} careers`
+        ];
+        
+        console.log('Starting multi-source search...');
+        
+        for (const searchQuery of searches) {
+            try {
+                const serperResponse = await axios.post(
+                    'https://google.serper.dev/search',
+                    { 
+                        q: searchQuery,
+                        num: 8 // Fewer per source
+                    },
+                    {
+                        headers: {
+                            'X-API-KEY': process.env.NEXT_PUBLIC_SERPER_API_KEY!,
+                            'Content-Type': 'application/json',
+                        },
+                        timeout: 10000
+                    }
+                );
+
+                const searchResults = serperResponse.data.organic || [];
+                
+                for (const result of searchResults) {
+                    // Skip if already processed
+                    if (processedUrls.has(result.link)) {
+                        continue;
+                    }
+                    processedUrls.add(result.link);
+                    
+                    const jobs = await processJobResult(result, refinements);
+                    allJobs.push(...jobs);
+                    
+                    // Stop early if we have enough
+                    if (allJobs.length >= 30) break;
+                }
+                
+            } catch (error) {
+                console.error(`Search failed for: ${searchQuery.split('site:')[1]}`);
+                continue;
+            }
+            
+            if (allJobs.length >= 30) break;
+        }
+        
+        console.log(`Raw jobs found: ${allJobs.length}`);
+        
+        // Remove duplicates
+        let uniqueJobs = removeDuplicateJobs(allJobs);
+        console.log(`After deduplication: ${uniqueJobs.length}`);
+        
+        // Filter for quality
+        uniqueJobs = filterQualityJobs(uniqueJobs);
+        console.log(`After quality filter: ${uniqueJobs.length}`);
+        
+        // Sort by match score
+        uniqueJobs.sort((a, b) => b.matchScore - a.matchScore);
+        
+        // Return exactly what we show
+        const finalJobs = uniqueJobs.slice(0, 20);
+        console.log(`Returning: ${finalJobs.length} jobs`);
+        
+        return finalJobs;
+        
+    } catch (error) {
+        console.error('Search error:', error);
+        return [];
+    }
 }
