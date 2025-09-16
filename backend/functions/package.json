@@ -14,11 +14,15 @@
   },
   "main": "lib/index.js",
   "dependencies": {
+    "@sparticuz/chromium": "^138.0.2",
     "@types/cheerio": "^1.0.0",
     "axios": "^1.12.2",
     "cheerio": "^1.1.2",
+    "cors": "^2.8.5",
     "firebase-admin": "^12.6.0",
-    "firebase-functions": "^6.0.1"
+    "firebase-functions": "^6.0.1",
+    "playwright-chromium": "^1.55.0",
+    "playwright-core": "^1.55.0"
   },
   "devDependencies": {
     "firebase-functions-test": "^3.1.0",

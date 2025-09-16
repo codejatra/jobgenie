@@ -1,44 +1,42 @@
 import * as admin from 'firebase-admin';
-import axios from 'axios';
-import * as cheerio from 'cheerio';
-import { onCall, HttpsError } from 'firebase-functions/https';
+import {  Browser, Page } from 'playwright-chromium';
+import { onCall, HttpsError } from 'firebase-functions/v2/https';
+
+import { chromium as playwrightChromium } from "playwright-core";
+import chromium from "@sparticuz/chromium";
 
 admin.initializeApp();
 
-// Type definitions
-interface ScrapeRequest {
-    url: string;
-    refinements?: {
-        location?: string;
-        jobTitle?: string;
-    };
-}
-
+// Interfaces
 interface JobData {
     url: string;
     title: string;
     company: string;
     location: string;
-    description?: string;
+    description: string;
     salary?: string;
+    postedDate?: string;
     requirements?: string[];
     responsibilities?: string[];
     employmentType?: string;
-    postedDate?: string;
+    workplaceType?: string;
+}
+
+interface ScrapeRequest {
+    url: string;
+    type?: 'single' | 'list';
 }
 
 interface ScrapeResponse {
-    type: 'single' | 'list';
-    jobs?: JobData[];
-    job?: JobData;
+    type: 'single' | 'multiple';
+    jobs: JobData[];
     error?: string;
 }
 
-
-export const scrapeJobPage = onCall(
+export const scrapeJobsWithPlaywright = onCall(
     {
-        timeoutSeconds: 60,
-        memory: "1GiB",
+        timeoutSeconds: 120,
+        memory: "2GiB",
     },
     async (request): Promise<ScrapeResponse> => {
         const data = request.data as ScrapeRequest;
@@ -48,397 +46,467 @@ export const scrapeJobPage = onCall(
         }
 
         const { url } = data;
-        console.log("Scraping URL:", url);
+        console.log("Scraping URL with Playwright:", url);
 
-        // Try multiple scraping methods
-        let scrapedData = null;
+        let browser: Browser | null = null;
+        let page: Page | null = null;
 
-        // Method 1: Direct HTTP request with better headers
-        scrapedData = await scrapeWithAxios(url);
+        try {
+            // Launch Playwright with optimized settings
+            browser = await playwrightChromium.launch({
+                args: chromium.args,
+                executablePath: await chromium.executablePath(),
+                headless: true, // usually true
+            });
 
-        // Method 2: If blocked, try with different user agent
-        if (!scrapedData || scrapedData.error) {
-            scrapedData = await scrapeWithDifferentHeaders(url);
+            page = await browser.newPage({
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            });
+
+            // Set viewport and extra headers
+            await page.setViewportSize({ width: 1920, height: 1080 });
+            await page.setExtraHTTPHeaders({
+                'Accept-Language': 'en-US,en;q=0.9'
+            });
+
+            // Navigate to the URL
+            await page.goto(url, {
+                waitUntil: 'domcontentloaded',
+                timeout: 30000
+            });
+
+            // Wait a bit for dynamic content
+            await page.waitForTimeout(2000);
+
+            // Determine the site and scrape accordingly
+            let jobs: JobData[] = [];
+
+            if (url.includes('linkedin.com')) {
+                jobs = await scrapeLinkedInJobs(page, url);
+            } else if (url.includes('indeed.com')) {
+                jobs = await scrapeIndeedJobs(page, url);
+            } else if (url.includes('glassdoor.com')) {
+                jobs = await scrapeGlassdoorJobs(page, url);
+            } else {
+                // Generic scraping for other sites
+                jobs = await scrapeGenericJobs(page, url);
+            }
+
+            console.log(`Scraped ${jobs.length} jobs from ${url}`);
+
+            return {
+                type: jobs.length > 1 ? 'multiple' : 'single',
+                jobs: jobs
+            };
+
+        } catch (error: any) {
+            console.error("Playwright scraping error:", error);
+            return {
+                type: 'single',
+                jobs: [],
+                error: error.message
+            };
+        } finally {
+            if (page) await page.close();
+            if (browser) await browser.close();
         }
-
-        // Method 3: Use proxy if still blocked
-        if (!scrapedData || scrapedData.error) {
-            scrapedData = await scrapeWithProxy(url);
-        }
-
-        return scrapedData || { type: 'single', error: 'All scraping methods failed' };
     }
 );
 
+// Scrape LinkedIn jobs (handles both single and multiple jobs)
+async function scrapeLinkedInJobs(page: Page, url: string): Promise<JobData[]> {
+    const jobs: JobData[] = [];
 
-async function scrapeWithAxios(url: string): Promise<ScrapeResponse> {
     try {
-        const response = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'Referer': 'https://www.google.com/',
-            },
-            timeout: 20000,
-            maxRedirects: 5,
-            validateStatus: (status) => status < 500
-        });
+        // Check if it's a job search page with multiple jobs
+        const isSearchPage = url.includes('/jobs/search') || url.includes('/jobs/collections');
 
-        if (response.status === 403 || response.status === 429) {
-            return { type: 'single', error: `Blocked: ${response.status}` };
-        }
+        if (isSearchPage) {
+            console.log('LinkedIn search page detected - extracting multiple jobs');
 
-        const $ = cheerio.load(response.data);
-        return extractJobData($, url);
+            // Wait for job cards to load
+            await page.waitForSelector('.jobs-search__results-list li', { timeout: 5000 }).catch(() => { });
 
-    } catch (error: any) {
-        console.error('Axios scraping failed:', error.message);
-        return { type: 'single', error: error.message };
-    }
-}
+            // Scroll to load more jobs
+            await autoScroll(page);
 
-async function scrapeWithDifferentHeaders(url: string): Promise<ScrapeResponse> {
-    const userAgents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-        'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
-    ];
+            // Extract all job links
+            const jobCards = await page.$$eval('.jobs-search__results-list li', (cards) => {
+                return cards.slice(0, 25).map(card => {
+                    const linkElement = card.querySelector('a');
+                    const titleElement = card.querySelector('.base-search-card__title');
+                    const companyElement = card.querySelector('.base-search-card__subtitle a');
+                    const locationElement = card.querySelector('.job-search-card__location');
+                    const timeElement = card.querySelector('time');
 
-    for (const ua of userAgents) {
-        try {
-            const response = await axios.get(url, {
-                headers: { 'User-Agent': ua },
-                timeout: 15000
+                    return {
+                        url: linkElement?.href || '',
+                        title: titleElement?.textContent?.trim() || '',
+                        company: companyElement?.textContent?.trim() || '',
+                        location: locationElement?.textContent?.trim() || '',
+                        postedDate: timeElement?.getAttribute('datetime') || timeElement?.textContent?.trim() || ''
+                    };
+                });
             });
 
-            const $ = cheerio.load(response.data);
-            return extractJobData($, url);
-        } catch (error) {
-            continue;
-        }
-    }
+            // Visit each job page to get full details
+            for (const jobCard of jobCards.slice(0, 20)) { // Limit to 20 jobs
+                if (jobCard.url && isRecentJob(jobCard.postedDate)) {
+                    try {
+                        console.log(`Fetching details for: ${jobCard.title}`);
 
-    return { type: 'single', error: 'All user agents blocked' };
-}
+                        // Navigate to job page
+                        await page.goto(jobCard.url, {
+                            waitUntil: 'domcontentloaded',
+                            timeout: 15000
+                        });
+                        await page.waitForTimeout(1500);
 
-async function scrapeWithProxy(url: string): Promise<ScrapeResponse> {
-    // Use a free proxy API or service
-    try {
-        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-        const response = await axios.get(proxyUrl, { timeout: 20000 });
-        const $ = cheerio.load(response.data);
-        return extractJobData($, url);
-    } catch (error) {
-        return { type: 'single', error: 'Proxy scraping failed' };
-    }
-}
+                        // Extract full job details
+                        const jobDetails = await page.evaluate(() => {
+                            const title = document.querySelector('.top-card-layout__title, h1')?.textContent?.trim() || '';
+                            const company = document.querySelector('.topcard__org-name-link, .top-card-layout__company')?.textContent?.trim() || '';
+                            const location = document.querySelector('.topcard__flavor--bullet, .top-card-layout__location')?.textContent?.trim() || '';
 
-function extractJobData($: cheerio.CheerioAPI, url: string): ScrapeResponse {
+                            // Get full description
+                            let description = '';
+                            const descElement = document.querySelector('.description__text, .show-more-less-html__markup, .jobs-description');
+                            if (descElement) {
+                                description = descElement.textContent?.trim() || '';
+                            }
 
-      // ✅ ADD THIS SECTION AT THE BEGINNING - Check for specific job sites first
-    if (url.includes('indeed.com')) {
-        return scrapeIndeed($, url);
-    }
-    if (url.includes('linkedin.com')) {
-        return scrapeLinkedIn($, url);
-    }
-    if (url.includes('glassdoor.com')) {
-        return scrapeGlassdoor($, url);
-    }
-    if (url.includes('angel.co') || url.includes('wellfound.com')) {
-        return scrapeAngelList($, url);
-    }
-    if (url.includes('greenhouse.io')) {
-        return scrapeGreenhouse($, url);
-    }
-    if (url.includes('lever.co')) {
-        return scrapeLever($, url);
-    }
-    if (url.includes('workday.com')) {
-        return scrapeWorkday($, url);
-    }
-    // Enhanced extraction logic
-    const extractText = (selectors: string[]): string => {
-        for (const selector of selectors) {
-            const text = $(selector).first().text().trim();
-            if (text && text.length > 3) return text;
-        }
-        return '';
-    };
+                            // Extract employment type
+                            const employmentType = document.querySelector('.description__job-criteria-text')?.textContent?.trim() || '';
 
-    // Try to extract as much data as possible
-    const job: JobData = {
-        url: url,
-        title: extractText([
-            'h1', '.jobTitle', '[class*="title"]', '[data-testid*="title"]',
-            '.job-title', '.position-title', 'h2.title'
-        ]),
-        company: extractText([
-            '.company', '.employer', '[class*="company"]', '[data-company]',
-            '.companyName', '[data-testid*="company"]'
-        ]),
-        location: extractText([
-            '.location', '[class*="location"]', '[data-location]',
-            '.locationsContainer', '[data-testid*="location"]'
-        ]),
-        salary: extractText([
-            '.salary', '[class*="salary"]', '[data-salary]',
-            '.compensation', '.pay', '[class*="compensation"]'
-        ]),
-        description: extractText([
-            '.description', '.job-description', '[class*="description"]',
-            '#jobDescriptionText', '.jobsearch-JobComponent-description',
-            'article', '.content', 'main'
-        ]).substring(0, 5000),
-        employmentType: extractText([
-            '.employment-type', '[class*="employment"]', '.job-type',
-            '[data-job-type]', '.metadata'
-        ])
-    };
+                            // Extract salary if available
+                            const salaryElement = document.querySelector('.salary, .compensation__salary');
+                            const salary = salaryElement?.textContent?.trim() || '';
 
-    // Extract structured data from JSON-LD if available
-    const jsonLd = $('script[type="application/ld+json"]').html();
-    if (jsonLd) {
-        try {
-            const data = JSON.parse(jsonLd);
-            if (data['@type'] === 'JobPosting') {
-                job.title = job.title || data.title;
-                job.company = job.company || data.hiringOrganization?.name;
-                job.location = job.location || data.jobLocation?.address?.addressLocality;
-                job.salary = job.salary || data.baseSalary?.value?.value;
-                job.description = job.description || data.description;
+                            return {
+                                title,
+                                company,
+                                location,
+                                description,
+                                employmentType,
+                                salary
+                            };
+                        });
+
+                        if (jobDetails.title && jobDetails.description) {
+                            jobs.push({
+                                url: jobCard.url,
+                                ...jobDetails,
+                                postedDate: jobCard.postedDate,
+                                requirements: extractRequirements(jobDetails.description),
+                                responsibilities: extractResponsibilities(jobDetails.description)
+                            });
+                        }
+
+                    } catch (err) {
+                        console.error(`Failed to scrape job details for ${jobCard.url}:`, err);
+                    }
+                }
             }
-        } catch (e) {
-            // Ignore JSON-LD parse errors
-        }
-    }
 
-    // Check if this is a job list page
-    const jobLinks = findJobLinks($, url);
-    if (jobLinks.length > 1 && (!job.title || !job.company)) {
-        return { type: 'list', jobs: jobLinks };
-    }
+        } else {
+            // Single job page
+            console.log('LinkedIn single job page detected');
 
-    return { type: 'single', job };
-}
+            const job = await page.evaluate(() => {
+                const title = document.querySelector('.top-card-layout__title, h1')?.textContent?.trim() || '';
+                const company = document.querySelector('.topcard__org-name-link')?.textContent?.trim() || '';
+                const location = document.querySelector('.topcard__flavor--bullet')?.textContent?.trim() || '';
+                const description = document.querySelector('.description__text, .show-more-less-html__markup')?.textContent?.trim() || '';
+                const employmentType = document.querySelector('.description__job-criteria-text')?.textContent?.trim() || '';
+                const salary = document.querySelector('.salary')?.textContent?.trim() || '';
+                const postedDate = document.querySelector('time')?.textContent?.trim() || '';
 
-function findJobLinks($: cheerio.CheerioAPI, baseUrl: string): JobData[] {
-    const jobs: JobData[] = [];
-    const linkSelectors = [
-        'a[href*="/jobs/view/"]',
-        'a[href*="/viewjob"]',
-        '.job-card a',
-        '[data-job-id] a',
-        '.jobsearch-SerpJobCard a'
-    ];
+                return {
+                    title,
+                    company,
+                    location,
+                    description,
+                    employmentType,
+                    salary,
+                    postedDate
+                };
+            });
 
-    linkSelectors.forEach(selector => {
-        $(selector).each((i, elem) => {
-            if (i >= 10) return;
-
-            const $elem = $(elem);
-            const href = $elem.attr('href');
-            if (href) {
-                const fullUrl = href.startsWith('http')
-                    ? href
-                    : new URL(href, baseUrl).href;
-
+            if (job.title && isRecentJob(job.postedDate)) {
                 jobs.push({
-                    url: fullUrl,
-                    title: $elem.text().trim() || $elem.closest('.job-card').find('.title').text(),
-                    company: $elem.closest('.job-card').find('.company').text(),
-                    location: $elem.closest('.job-card').find('.location').text()
+                    url,
+                    ...job,
+                    requirements: extractRequirements(job.description),
+                    responsibilities: extractResponsibilities(job.description)
                 });
             }
-        });
-    });
+        }
+
+    } catch (error) {
+        console.error('LinkedIn scraping error:', error);
+    }
 
     return jobs;
 }
 
-function scrapeAngelList($: cheerio.CheerioAPI, url: string): ScrapeResponse {
-    const job: JobData = {
-        url: url,
-        title: $('.styles_title__2NjT8').text().trim() || $('h1').first().text().trim(),
-        company: $('.styles_name__3e_c6').text().trim() || $('[data-test="CompanyName"]').text().trim(),
-        location: $('.styles_location__1R7mD').text().trim(),
-        salary: $('.styles_salary__1xbF7').text().trim(),
-        description: $('.styles_description__3lf0V').text().trim() || $('.job-description').text().trim(),
-        employmentType: $('.styles_jobType__3K7gZ').text().trim()
-    };
-    
-    return { type: 'single', job };
-}
+// Scrape Indeed jobs
+async function scrapeIndeedJobs(page: Page, url: string): Promise<JobData[]> {
+    const jobs: JobData[] = [];
 
-function scrapeGreenhouse($: cheerio.CheerioAPI, url: string): ScrapeResponse {
-    const job: JobData = {
-        url: url,
-        title: $('#header h1').text().trim() || $('.app-title').text().trim(),
-        company: $('.company-name').text().trim() || $('[data-element="company-name"]').text().trim(),
-        location: $('.location').text().trim(),
-        salary: '',
-        description: $('#content').text().trim() || $('.content').text().trim(),
-        employmentType: $('.commitment').text().trim()
-    };
-    
-    return { type: 'single', job };
-}
+    try {
+        const isSearchPage = url.includes('-jobs.html') || url.includes('/jobs?');
 
-function scrapeLever($: cheerio.CheerioAPI, url: string): ScrapeResponse {
-    const job: JobData = {
-        url: url,
-        title: $('h2').first().text().trim() || $('.posting-headline h2').text().trim(),
-        company: $('.posting-categories .company').text().trim(),
-        location: $('.location').text().trim() || $('.posting-categories .workplaceTypes').text().trim(),
-        salary: '',
-        description: $('.posting-description').text().trim() || $('.section-wrapper').text().trim(),
-        employmentType: $('.commitment').text().trim()
-    };
-    
-    return { type: 'single', job };
-}
+        if (isSearchPage) {
+            console.log('Indeed search page detected - extracting multiple jobs');
 
-function scrapeWorkday($: cheerio.CheerioAPI, url: string): ScrapeResponse {
-    const job: JobData = {
-        url: url,
-        title: $('[data-automation-id="jobPostingHeader"]').text().trim(),
-        company: $('[data-automation-id="company"]').text().trim(),
-        location: $('[data-automation-id="locationText"]').text().trim(),
-        salary: $('[data-automation-id="salary"]').text().trim(),
-        description: $('[data-automation-id="jobPostingDescription"]').text().trim(),
-        employmentType: $('[data-automation-id="jobType"]').text().trim()
-    };
-    
-    return { type: 'single', job };
-}
+            await page.waitForSelector('.jobsearch-ResultsList', { timeout: 5000 }).catch(() => { });
+            await autoScroll(page);
 
+            // Get all job cards
+            const jobCards = await page.$$eval('[data-jk]', (cards) => {
+                return cards.slice(0, 25).map(card => {
+                    const titleElement = card.querySelector('.jobTitle span[title]');
+                    const companyElement = card.querySelector('.companyName');
+                    const locationElement = card.querySelector('.companyLocation');
+                    const dateElement = card.querySelector('.date');
+                    const linkElement = card.querySelector('.jobTitle a');
+                    const jobKey = card.getAttribute('data-jk');
 
-// Add these functions if they're missing:
+                    return {
+                        jobKey,
+                        url: linkElement?.baseURI || `https://www.indeed.com/viewjob?jk=${jobKey}`,
+                        title: titleElement?.textContent?.trim() || '',
+                        company: companyElement?.textContent?.trim() || '',
+                        location: locationElement?.textContent?.trim() || '',
+                        postedDate: dateElement?.textContent?.trim() || ''
+                    };
+                });
+            });
 
-function scrapeIndeed($: cheerio.CheerioAPI, url: string): ScrapeResponse {
-    if (url.includes('-jobs.html') || url.includes('/jobs?')) {
-        const jobs: JobData[] = [];
-        
-        $('.jobsearch-ResultsList .result, .jobsearch-SerpJobCard, [data-jk]').each((i, elem) => {
-            if (i >= 15) return;
-            
-            const $elem = $(elem);
-            const jobId = $elem.attr('data-jk');
-            const jobLink = $elem.find('.jobTitle a, h2 a').attr('href');
-            const fullUrl = jobLink?.startsWith('http') 
-                ? jobLink 
-                : `https://www.indeed.com${jobLink || `/viewjob?jk=${jobId}`}`;
-            
-            const job: JobData = {
-                url: fullUrl,
-                title: $elem.find('.jobTitle span[title]').text().trim(),
-                company: $elem.find('.companyName').text().trim(),
-                location: $elem.find('.locationsContainer').text().trim(),
-                salary: $elem.find('.salary-snippet').text().trim()
-            };
-            
-            if (job.title && job.company) {
-                jobs.push(job);
+            // Get full details for each job
+            for (const jobCard of jobCards.slice(0, 20)) {
+                if (jobCard.url && isRecentJob(jobCard.postedDate)) {
+                    try {
+                        await page.goto(jobCard.url, {
+                            waitUntil: 'domcontentloaded',
+                            timeout: 15000
+                        });
+                        await page.waitForTimeout(1500);
+
+                        const jobDetails = await page.evaluate(() => {
+                            const title = document.querySelector('.jobsearch-JobInfoHeader-title span')?.textContent?.trim() || '';
+                            const company = document.querySelector('[data-company-name="true"]')?.textContent?.trim() || '';
+                            const location = document.querySelector('[data-testid="job-location"]')?.textContent?.trim() || '';
+                            const salary = document.querySelector('[data-testid="job-salary"]')?.textContent?.trim() || '';
+                            const description = document.querySelector('#jobDescriptionText')?.textContent?.trim() || '';
+                            const employmentType = document.querySelector('.jobsearch-JobMetadataHeader-item')?.textContent?.trim() || '';
+
+                            return {
+                                title,
+                                company,
+                                location,
+                                salary,
+                                description,
+                                employmentType
+                            };
+                        });
+
+                        if (jobDetails.title && jobDetails.description) {
+                            jobs.push({
+                                url: jobCard.url,
+                                ...jobDetails,
+                                postedDate: jobCard.postedDate,
+                                requirements: extractRequirements(jobDetails.description),
+                                responsibilities: extractResponsibilities(jobDetails.description)
+                            });
+                        }
+
+                    } catch (err) {
+                        console.error(`Failed to scrape Indeed job: ${err}`);
+                    }
+                }
             }
-        });
-        
-        return { type: 'list', jobs };
-    }
-    
-    return scrapeIndeedJob($, url);
-}
 
-function scrapeIndeedJob($: cheerio.CheerioAPI, url: string): ScrapeResponse {
-    const job: JobData = {
-        url: url,
-        title: $('.jobsearch-JobInfoHeader-title, h1').first().text().trim(),
-        company: $('.jobsearch-CompanyInfoWithoutHeaderImage .companyName').text().trim(),
-        location: $('.jobsearch-JobInfoHeader-subtitle > div:last-child').text().trim(),
-        salary: $('.jobsearch-JobMetadataHeader-item .attribute_snippet').text().trim(),
-        employmentType: $('.jobsearch-JobMetadataHeader-item').text().trim(),
-        description: $('#jobDescriptionText').text().trim()
-    };
-    
-    return { type: 'single', job };
-}
+        } else {
+            // Single job page
+            const job = await page.evaluate(() => {
+                const title = document.querySelector('.jobsearch-JobInfoHeader-title span')?.textContent?.trim() || '';
+                const company = document.querySelector('[data-company-name="true"]')?.textContent?.trim() || '';
+                const location = document.querySelector('[data-testid="job-location"]')?.textContent?.trim() || '';
+                const salary = document.querySelector('[data-testid="job-salary"]')?.textContent?.trim() || '';
+                const description = document.querySelector('#jobDescriptionText')?.textContent?.trim() || '';
+                const employmentType = document.querySelector('.jobsearch-JobMetadataHeader-item')?.textContent?.trim() || '';
+                const postedDate = document.querySelector('.jobsearch-JobInfoHeader-underTitle .date')?.textContent?.trim() || '';
 
-function scrapeLinkedIn($: cheerio.CheerioAPI, url: string): ScrapeResponse {
-    if (url.includes('/jobs/search') || url.includes('/jobs/collections')) {
-        const jobs: JobData[] = [];
-        
-        $('.jobs-search__results-list li').each((i, elem) => {
-            if (i >= 15) return;
-            
-            const $elem = $(elem);
-            const jobLink = $elem.find('a').first().attr('href');
-            
-            const job: JobData = {
-                url: jobLink?.startsWith('http') ? jobLink : `https://www.linkedin.com${jobLink}`,
-                title: $elem.find('.job-card-list__title').text().trim(),
-                company: $elem.find('.job-card-container__company-name').text().trim(),
-                location: $elem.find('.job-card-container__metadata-item').first().text().trim()
-            };
-            
-            if (job.title && job.url) {
-                jobs.push(job);
+                return {
+                    title,
+                    company,
+                    location,
+                    salary,
+                    description,
+                    employmentType,
+                    postedDate
+                };
+            });
+
+            if (job.title && isRecentJob(job.postedDate)) {
+                jobs.push({
+                    url,
+                    ...job,
+                    requirements: extractRequirements(job.description),
+                    responsibilities: extractResponsibilities(job.description)
+                });
             }
-        });
-        
-        return { type: 'list', jobs };
+        }
+
+    } catch (error) {
+        console.error('Indeed scraping error:', error);
     }
-    
-    return scrapeLinkedInJob($, url);
+
+    return jobs;
 }
 
-function scrapeLinkedInJob($: cheerio.CheerioAPI, url: string): ScrapeResponse {
-    const job: JobData = {
-        url: url,
-        title: $('.top-card-layout__title, h1').first().text().trim(),
-        company: $('.topcard__org-name-link').text().trim(),
-        location: $('.topcard__flavor--bullet').first().text().trim(),
-        employmentType: $('.jobs-unified-top-card__workplace-type').text().trim(),
-        description: $('.description__text, .show-more-less-html__markup').text().trim()
-    };
-    
-    return { type: 'single', job };
+// Similar functions for Glassdoor and generic sites
+async function scrapeGlassdoorJobs(page: Page, url: string): Promise<JobData[]> {
+    // Similar implementation for Glassdoor
+    const jobs: JobData[] = [];
+    // ... implement Glassdoor scraping
+    return jobs;
 }
 
-function scrapeGlassdoor($: cheerio.CheerioAPI, url: string): ScrapeResponse {
-    if (url.includes('/Job/jobs')) {
-        const jobs: JobData[] = [];
-        
-        $('[data-test="job-link"]').each((i, elem) => {
-            if (i >= 15) return;
-            
-            const $elem = $(elem);
-            const jobLink = $elem.attr('href');
-            
-            const job: JobData = {
-                url: jobLink?.startsWith('http') ? jobLink : `https://www.glassdoor.com${jobLink}`,
-                title: $elem.find('.job-title').text().trim(),
-                company: $elem.find('[data-test="employer-name"]').text().trim(),
-                location: $elem.find('[data-test="employer-location"]').text().trim()
+async function scrapeGenericJobs(page: Page, url: string): Promise<JobData[]> {
+    // Generic job scraping
+    const jobs: JobData[] = [];
+
+    try {
+        const job = await page.evaluate(() => {
+            const title = document.querySelector('h1')?.textContent?.trim() || '';
+            const description = document.querySelector('main, article, .content')?.textContent?.trim() || '';
+
+            return {
+                title,
+                description,
+                company: '',
+                location: ''
             };
-            
-            if (job.title && job.url) {
-                jobs.push(job);
-            }
         });
-        
-        return { type: 'list', jobs };
+
+        if (job.title && job.description) {
+            jobs.push({
+                url,
+                ...job,
+                requirements: extractRequirements(job.description),
+                responsibilities: extractResponsibilities(job.description)
+            });
+        }
+    } catch (error) {
+        console.error('Generic scraping error:', error);
     }
-    
-    const job: JobData = {
-        url: url,
-        title: $('[data-test="job-title"], h1').first().text().trim(),
-        company: $('[data-test="employer-name"]').text().trim(),
-        location: $('[data-test="location"]').text().trim(),
-        salary: $('.salary-estimate').text().trim(),
-        description: $('.desc, .jobDescriptionContent').text().trim()
-    };
-    
-    return { type: 'single', job };
+
+    return jobs;
+}
+
+// Helper function to auto-scroll page
+async function autoScroll(page: Page): Promise<void> {
+    await page.evaluate(async () => {
+        await new Promise<void>((resolve) => {
+            let totalHeight = 0;
+            const distance = 100;
+            const timer = setInterval(() => {
+                const scrollHeight = document.body.scrollHeight;
+                window.scrollBy(0, distance);
+                totalHeight += distance;
+
+                if (totalHeight >= scrollHeight) {
+                    clearInterval(timer);
+                    resolve();
+                }
+            }, 100);
+        });
+    });
+}
+
+// Check if job is recent (within 4 days)
+function isRecentJob(dateStr: string): boolean {
+    if (!dateStr) return true; // If no date, include it
+
+    const lower = dateStr.toLowerCase();
+
+    // Check for fresh indicators
+    if (lower.includes('just posted') ||
+        lower.includes('today') ||
+        lower.includes('1 day') ||
+        lower.includes('2 days') ||
+        lower.includes('3 days') ||
+        lower.includes('4 days')) {
+        return true;
+    }
+
+    // Reject old jobs
+    if (lower.includes('week') ||
+        lower.includes('month') ||
+        lower.includes('30+ days')) {
+        return false;
+    }
+
+    // Check for number of days
+    const match = lower.match(/(\d+)\s*days?/);
+    if (match) {
+        const days = parseInt(match[1]);
+        return days <= 4;
+    }
+
+    return true; // Default to include
+}
+
+// Extract requirements from description
+function extractRequirements(description: string): string[] {
+    const requirements: string[] = [];
+    const lines = description.split(/\n|\.|\•|\-/);
+
+    let inRequirements = false;
+    for (const line of lines) {
+        const lower = line.toLowerCase();
+        if (lower.includes('requirement') || lower.includes('qualification') || lower.includes('must have')) {
+            inRequirements = true;
+            continue;
+        }
+
+        if (inRequirements && line.trim().length > 10) {
+            requirements.push(line.trim());
+            if (requirements.length >= 5) break;
+        }
+
+        if (inRequirements && (lower.includes('responsibilit') || lower.includes('benefit'))) {
+            break;
+        }
+    }
+
+    return requirements.slice(0, 5);
+}
+
+// Extract responsibilities from description  
+function extractResponsibilities(description: string): string[] {
+    const responsibilities: string[] = [];
+    const lines = description.split(/\n|\.|\•|\-/);
+
+    let inResponsibilities = false;
+    for (const line of lines) {
+        const lower = line.toLowerCase();
+        if (lower.includes('responsibilit') || lower.includes('duties') || lower.includes('you will')) {
+            inResponsibilities = true;
+            continue;
+        }
+
+        if (inResponsibilities && line.trim().length > 10) {
+            responsibilities.push(line.trim());
+            if (responsibilities.length >= 5) break;
+        }
+
+        if (inResponsibilities && (lower.includes('requirement') || lower.includes('benefit'))) {
+            break;
+        }
+    }
+
+    return responsibilities.slice(0, 5);
 }
